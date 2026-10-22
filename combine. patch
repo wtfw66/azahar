@@ -1,0 +1,244 @@
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 164fc3e..5b32eeb 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -468,6 +468,8 @@ private:
+     Result KernelSetState(u32 kernel_state, u32 varg1, u32 varg2);
+     Result QueryProcessMemory(MemoryInfo* memory_info, PageInfo* page_info, Handle process_handle,
+                               u32 addr);
++    Result ControlProcessMemory(Handle process_handle, u32 addr0, u32 addr1, u32 size,
++                                u32 operation, u32 permissions);
+     Result QueryMemory(MemoryInfo* memory_info, PageInfo* page_info, u32 addr);
+     Result CreateEvent(Handle* out_handle, u32 reset_type);
+     Result DuplicateHandle(Handle* out, Handle handle);
+@@ -579,6 +581,71 @@ Result SVC::ControlMemory(u32* out_addr, u32 addr0, u32 addr1, u32 size, u32 ope
+     return ResultSuccess;
+ }
+ 
++/// Controls memory mappings in a target process. Unlike ControlMemory, this is the one SVC
++/// that may create executable mappings; loaders use it to make injected code executable.
++Result SVC::ControlProcessMemory(Handle process_handle, u32 addr0, u32 addr1, u32 size,
++                                 u32 operation, u32 permissions) {
++    LOG_DEBUG(Kernel_SVC,
++              "called process=0x{:08X}, addr0=0x{:08X}, addr1=0x{:08X}, size=0x{:X}, "
++              "operation=0x{:08X}, permissions=0x{:08X}",
++              process_handle, addr0, addr1, size, operation, permissions);
++
++    Result result = ResultSuccess;
++
++    const std::shared_ptr<Process> process =
++        kernel.GetCurrentProcess()->handle_table.Get<Process>(process_handle);
++    if (!process) {
++        result = ResultInvalidHandle;
++    } else {
++        operation &= ~MEMOP_REGION_MASK;
++
++        switch (operation & MEMOP_OPERATION_MASK) {
++        case MEMOP_MAP:
++        case MEMOP_UNMAP: {
++            if ((addr0 & Memory::CITRA_PAGE_MASK) != 0 || (addr1 & Memory::CITRA_PAGE_MASK) != 0) {
++                result = ResultMisalignedAddress;
++            } else if ((size & Memory::CITRA_PAGE_MASK) != 0) {
++                result = ResultMisalignedSize;
++            } else if ((permissions & ~static_cast<u32>(VMAPermission::ReadWriteExecute)) != 0) {
++                // Executable permissions are the purpose of this SVC, but nothing outside
++                // Read/Write/Execute is meaningful.
++                result = ResultInvalidCombination;
++            } else {
++                const auto vma_permissions = static_cast<VMAPermission>(permissions);
++                if ((operation & MEMOP_OPERATION_MASK) == MEMOP_MAP) {
++                    result = process->Map(addr0, addr1, size, vma_permissions, true);
++                } else {
++                    result = process->Unmap(addr0, addr1, size, vma_permissions, true);
++                }
++            }
++            break;
++        }
++        case MEMOP_PROTECT: {
++            if ((addr0 & Memory::CITRA_PAGE_MASK) != 0) {
++                result = ResultMisalignedAddress;
++            } else if ((size & Memory::CITRA_PAGE_MASK) != 0) {
++                result = ResultMisalignedSize;
++            } else if (permissions == 0 ||
++                       (permissions & ~static_cast<u32>(VMAPermission::ReadWriteExecute)) != 0) {
++                result = ResultInvalidCombination;
++            } else {
++                result = process->vm_manager.ReprotectRange(
++                    addr0, size, static_cast<VMAPermission>(permissions));
++            }
++            break;
++        }
++        default:
++            LOG_ERROR(Kernel_SVC, "unknown operation=0x{:08X}", operation);
++            result = ResultInvalidCombination;
++            break;
++        }
++    }
++
++    LOG_INFO(Kernel_SVC, "[MODDBG] SVC 0x70 ControlProcessMemory op={} result={:#010x}",
++             operation & MEMOP_OPERATION_MASK, result.raw);
++    return result;
++}
++
+ void SVC::ExitProcess() {
+     kernel.TerminateProcess(kernel.GetCurrentProcess());
+ }
+@@ -2352,7 +2419,7 @@ const std::array<SVC::FunctionDef, 180> SVC::SVC_Table{{
+     {0x6D, nullptr, "GetDebugThreadParam", 1000},
+     {0x6E, nullptr, "Unknown", 1000},
+     {0x6F, nullptr, "Unknown", 1000},
+-    {0x70, nullptr, "ControlProcessMemory", 1000},
++    {0x70, &SVC::Wrap<&SVC::ControlProcessMemory, 0x70>, "ControlProcessMemory", 1000},
+     {0x71, nullptr, "MapProcessMemory", 1000},
+     {0x72, nullptr, "UnmapProcessMemory", 1000},
+     {0x73, nullptr, "CreateCodeSet", 1000},
+diff --git a/src/core/file_sys/layered_fs.cpp b/src/core/file_sys/layered_fs.cpp
+index a8e73b2..142cbeb 100644
+--- a/src/core/file_sys/layered_fs.cpp
++++ b/src/core/file_sys/layered_fs.cpp
+@@ -177,10 +177,29 @@ void LayeredFS::LoadRelocations() {
+             }
+ 
+             auto* file = file_path_map.at(path);
++
++            // Load the replacement into memory once, here at load time, and serve it from
++            // memory exactly like patched (type 2) files. The previous behavior kept only a
++            // host path and re-opened the file on every read; a failed open left the guest
++            // buffer unwritten while the read still advanced. If the replacement cannot be
++            // read now, it is not registered at all and the stock RomFS contents are served.
++            FileUtil::IOFile replace_file(directory + virtual_name, "rb");
++            const auto replace_size = replace_file.GetSize();
++            std::vector<u8> buffer(replace_size);
++            if (!replace_file ||
++                replace_file.ReadBytes(buffer.data(), replace_size) != replace_size) {
++                LOG_ERROR(Service_FS, "[MODDBG] FAILED replacement load for {} ({} bytes)", path,
++                          replace_size);
++                return true;
++            }
++
+             file->relocation.type = 1;
+             file->relocation.replace_file_path = directory + virtual_name;
+-            file->relocation.size = FileUtil::GetSize(directory + virtual_name);
++            file->relocation.size = replace_size;
++            file->relocation.patched_file = std::move(buffer);
+             LOG_INFO(Service_FS, "LayeredFS replacement file in use for {}", path);
++            LOG_INFO(Service_FS, "[MODDBG] replacement loaded {} ({} bytes, served from memory)",
++                     path, replace_size);
+             return true;
+         };
+ 
+@@ -521,18 +540,17 @@ std::size_t LayeredFS::ReadFile(std::size_t offset, std::size_t length, u8* buff
+         if (relocation.type == 0) { // none
+             romfs->ReadFile(relocation.original_offset + relative_offset, to_read,
+                             buffer + read_size);
+-        } else if (relocation.type == 1) { // replace
+-            FileUtil::IOFile replace_file(relocation.replace_file_path, "rb");
+-            if (replace_file) {
+-                replace_file.Seek(relative_offset, SEEK_SET);
+-                replace_file.ReadBytes(buffer + read_size, to_read);
+-            } else {
+-                LOG_ERROR(Service_FS, "Could not open replacement file for {}",
+-                          current->second->path);
++        } else if (relocation.type == 1 || relocation.type == 2) { // replace (preloaded) / patch
++            if (to_read != 0) {
++                if (relative_offset + to_read <= relocation.patched_file.size()) {
++                    std::memcpy(buffer + read_size,
++                                relocation.patched_file.data() + relative_offset, to_read);
++                } else {
++                    LOG_ERROR(Service_FS,
++                              "[MODDBG] FAILED replacement read for {} (offset {}, length {})",
++                              current->second->path, relative_offset, to_read);
++                }
+             }
+-        } else if (relocation.type == 2) { // patch
+-            std::memcpy(buffer + read_size, relocation.patched_file.data() + relative_offset,
+-                        to_read);
+         } else {
+             UNREACHABLE();
+         }
+diff --git a/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/BooleanSetting.kt b/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/BooleanSetting.kt
+index b45c270..93006da 100644
+--- a/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/BooleanSetting.kt
++++ b/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/BooleanSetting.kt
+@@ -13,7 +13,7 @@ enum class BooleanSetting(
+ ) : AbstractBooleanSetting {
+     EXPAND_TO_CUTOUT_AREA(SettingKeys.expand_to_cutout_area(), Settings.SECTION_LAYOUT, false),
+     SPIRV_SHADER_GEN(SettingKeys.spirv_shader_gen(), Settings.SECTION_RENDERER, true),
+-    ASYNC_SHADERS(SettingKeys.async_shader_compilation(), Settings.SECTION_RENDERER, false),
++    ASYNC_SHADERS(SettingKeys.async_shader_compilation(), Settings.SECTION_RENDERER, true),
+     DISABLE_SPIRV_OPTIMIZER(SettingKeys.disable_spirv_optimizer(), Settings.SECTION_RENDERER, true),
+     PLUGIN_LOADER(SettingKeys.plugin_loader(), Settings.SECTION_SYSTEM, false),
+     ALLOW_PLUGIN_LOADER(SettingKeys.allow_plugin_loader(), Settings.SECTION_SYSTEM, true),
+diff --git a/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/IntSetting.kt
+index f4108f3..2b2aee3 100644
+--- a/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/citra/citra_emu/features/settings/model/IntSetting.kt
+@@ -11,14 +11,14 @@ enum class IntSetting(
+     override val section: String,
+     override val defaultValue: Int
+ ) : AbstractIntSetting {
+-    FRAME_LIMIT(SettingKeys.frame_limit(), Settings.SECTION_RENDERER, 100),
++    FRAME_LIMIT(SettingKeys.frame_limit(), Settings.SECTION_RENDERER, 300),
+     EMULATED_REGION(SettingKeys.region_value(), Settings.SECTION_SYSTEM, -1),
+     INIT_CLOCK(SettingKeys.init_clock(), Settings.SECTION_SYSTEM, 0),
+     CAMERA_INNER_FLIP(SettingKeys.camera_inner_flip(), Settings.SECTION_CAMERA, 0),
+     CAMERA_OUTER_LEFT_FLIP(SettingKeys.camera_outer_left_flip(), Settings.SECTION_CAMERA, 0),
+     CAMERA_OUTER_RIGHT_FLIP(SettingKeys.camera_outer_right_flip(), Settings.SECTION_CAMERA, 0),
+     GRAPHICS_API(SettingKeys.graphics_api(), Settings.SECTION_RENDERER, 2),
+-    RESOLUTION_FACTOR(SettingKeys.resolution_factor(), Settings.SECTION_RENDERER, 1),
++    RESOLUTION_FACTOR(SettingKeys.resolution_factor(), Settings.SECTION_RENDERER, 2),
+     STEREOSCOPIC_3D_MODE(SettingKeys.render_3d(), Settings.SECTION_RENDERER, 2),
+     STEREOSCOPIC_3D_DEPTH(SettingKeys.factor_3d(), Settings.SECTION_RENDERER, 0),
+     STEPS_PER_HOUR(SettingKeys.steps_per_hour(), Settings.SECTION_SYSTEM, 0),
+diff --git a/src/common/settings.h b/src/common/settings.h
+index c83f322..a8fd2fb 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -534,7 +534,7 @@ struct Values {
+     Setting<bool> dump_command_buffers{false, Keys::dump_command_buffers};
+     SwitchableSetting<bool> spirv_shader_gen{true, Keys::spirv_shader_gen};
+     SwitchableSetting<bool> disable_spirv_optimizer{true, Keys::disable_spirv_optimizer};
+-    SwitchableSetting<bool> async_shader_compilation{false, Keys::async_shader_compilation};
++    SwitchableSetting<bool> async_shader_compilation{true, Keys::async_shader_compilation};
+     SwitchableSetting<bool> async_presentation{true, Keys::async_presentation};
+     SwitchableSetting<bool> use_hw_shader{true, Keys::use_hw_shader};
+     SwitchableSetting<bool> use_disk_shader_cache{true, Keys::use_disk_shader_cache};
+@@ -548,9 +548,9 @@ struct Values {
+     SwitchableSetting<bool> use_display_refresh_rate_detection{
+         true, Keys::use_display_refresh_rate_detection};
+     Setting<bool> use_shader_jit{true, Keys::use_shader_jit};
+-    SwitchableSetting<u32, true> resolution_factor{1, 0, 18, Keys::resolution_factor};
++    SwitchableSetting<u32, true> resolution_factor{2, 0, 18, Keys::resolution_factor};
+     SwitchableSetting<bool> use_integer_scaling{false, Keys::use_integer_scaling};
+-    SwitchableSetting<double, true> frame_limit{100, 0, 1000, Keys::frame_limit};
++    SwitchableSetting<double, true> frame_limit{300, 0, 1000, Keys::frame_limit};
+     SwitchableSetting<double, true> turbo_limit{200, 0, 1000, Keys::turbo_limit};
+     SwitchableSetting<TextureFilter> texture_filter{TextureFilter::NoFilter, Keys::texture_filter};
+     SwitchableSetting<TextureSampling> texture_sampling{TextureSampling::GameControlled,
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index d873af1..4a34fd1 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -21,7 +21,7 @@ plugins {
+  * next 680 years.
+  */
+ val autoVersion = (((System.currentTimeMillis() / 1000) - 1451606400) / 10).toInt()
+-val abiFilter = listOf("arm64-v8a", "x86_64")
++val abiFilter = listOf("arm64-v8a")
+ 
+ val downloadedJniLibsPath = "${layout.buildDirectory.get().asFile.path}/downloadedJniLibs"
+ 
+@@ -82,7 +82,12 @@ android {
+                     "-DANDROID_ARM_NEON=true", // cryptopp requires Neon to work
+                     "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", // Support Android 15 16KiB page
+                     // sizes
+-                    "-DENABLE_GDBSTUB=OFF" // Disable GDB stub
++                    "-DENABLE_GDBSTUB=OFF", // Disable GDB stub
++                    // Tuned for the target device (Pixel 3 XL, Snapdragon 845 / Kryo 385 =
++                    // ARMv8.2-A). Verified to replace the toolchain's -march=armv8-a in the
++                    // generated build rules; all other toolchain flags are untouched.
++                    "-DCMAKE_C_FLAGS=-march=armv8.2-a+crc+crypto -mtune=cortex-a75",
++                    "-DCMAKE_CXX_FLAGS=-march=armv8.2-a+crc+crypto -mtune=cortex-a75"
+                 )
+             }
+         }
