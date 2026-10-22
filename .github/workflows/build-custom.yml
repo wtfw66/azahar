@@ -34,8 +34,12 @@ jobs:
       # installed build). A tag checkout is the standard release path; the
       # earlier raw-SHA pin died in this step. combined.patch is not in the
       # tag tree, so it is fetched from this fork's master, where it lives.
+      # The tag is checked out from Azahar's own repo: this fork has NO tags
+      # (verified via API 2026-10-22), so fetching 2126.2 from origin fails.
+      # Upstream is public, so the default token can read it.
       - uses: actions/checkout@v6
         with:
+          repository: azahar-emu/azahar
           ref: 2126.2
           submodules: recursive
 
