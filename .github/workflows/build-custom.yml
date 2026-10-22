@@ -30,36 +30,26 @@ jobs:
       OS: android
       TARGET: vanilla
     steps:
-      # combined.patch lives only on the fork's master; the pinned checkout below
-      # replaces the whole tree and would wipe it. Grab it first, keep it outside
-      # the workspace, and apply from there.
-      - name: Save combined.patch
-        uses: actions/checkout@v6
-        with:
-          sparse-checkout: |
-            combined.patch
-          sparse-checkout-cone-mode: false
-
-      - name: Stash patch outside the tree
-        run: |
-          set -e
-          if [ ! -f combined.patch ]; then
-            echo "::error::combined.patch is missing from the repo root. Upload it there before running this workflow."
-            exit 1
-          fi
-          cp combined.patch "$RUNNER_TEMP/combined.patch"
-          ls -l "$RUNNER_TEMP/combined.patch"
-
+      # Check out the 2126.2 TAG (== commit 219d743, the source of the user's
+      # installed build). A tag checkout is the standard release path; the
+      # earlier raw-SHA pin died in this step. combined.patch is not in the
+      # tag tree, so it is fetched from this fork's master, where it lives.
       - uses: actions/checkout@v6
         with:
-          ref: 219d743a1e698101fe1ab8bef43e6563126c3c27
+          ref: 2126.2
           submodules: recursive
+
+      - name: Fetch combined.patch from master
+        run: |
+          set -e
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/master/combined.patch" -o combined.patch
+          ls -l combined.patch
 
       - name: Apply combined.patch
         run: |
           set -e
-          git apply --check "$RUNNER_TEMP/combined.patch"
-          git apply -v "$RUNNER_TEMP/combined.patch"
+          git apply --check combined.patch
+          git apply -v combined.patch
           echo "combined.patch applied cleanly:"
           git status --porcelain
 
