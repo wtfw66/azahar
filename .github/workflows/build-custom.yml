@@ -1,6 +1,8 @@
 # Custom Azahar (2126.2 + SVC 0x70 + LayeredFS preload + SD845 defaults) — cloud build.
 #
-# Runs on a PRISTINE fork of azahar-emu/azahar. One extra file must sit at the repo
+# Runs on a PRISTINE fork of azahar-emu/azahar. The checkout is PINNED to
+# commit 219d743 (Azahar 2126.2, the build the patch was cut against): a fork
+# copies upstream's moving master, which drifts and breaks patch context. One extra file must sit at the repo
 # root: combined.patch (the four custom changes in one file). The first build step
 # applies it; everything after that mirrors Azahar's own CI Android job
 # (.github/workflows/build.yml "android" + .ci/android.sh) with three deltas:
@@ -30,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: 219d743a1e698101fe1ab8bef43e6563126c3c27
           submodules: recursive
 
       - name: Apply combined.patch
